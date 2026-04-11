@@ -37,6 +37,10 @@ terraform/environments/*/terraform.tfvars
 .DS_Store
 Thumbs.db
 
+# Claude Code
+CLAUDE.md
+.claude/
+
 # IDE
 .idea/
 .vscode/
