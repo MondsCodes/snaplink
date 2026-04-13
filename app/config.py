@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     base_url: str = "http://localhost:8000"
-    app_name: str = "SnapLink"
+    app_name: str = "SnapLink URL Shortener"
     database_url: str = "postgresql+asyncpg://snaplink:snaplink@localhost:5432/snaplink"
     redis_url: str = "redis://localhost:6379/0"
 
