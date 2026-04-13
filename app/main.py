@@ -1,20 +1,22 @@
 import secrets
-from datetime import UTC, datetime
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
+from sqlalchemy import select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import AsyncSessionLocal, get_db
+from app.db_models import Url
 from app.models import ShortenRequest, ShortenResponse
-from app.storage import URLRecord, store
 
 app = FastAPI(title=settings.app_name)
 
-# Prometheus counters and gauges — defined at module level so they persist across requests
+# Prometheus counters — reset on process restart, which is acceptable for a portfolio project
 urls_created_total = Counter("snaplink_urls_created_total", "Total number of URLs shortened")
 redirects_total = Counter("snaplink_redirects_total", "Total number of redirects served")
-urls_stored = Gauge("snaplink_urls_stored", "Current number of URLs in storage")
 
 
 # NOTE: Fixed paths (/healthz, /readyz, /metrics) MUST be defined before /{code}.
@@ -28,9 +30,13 @@ async def healthz() -> dict[str, str]:
 
 
 @app.get("/readyz", tags=["ops"])
-async def readyz() -> dict[str, str]:
-    """Readiness probe — in milestone 1, storage is in-memory so always ready."""
-    return {"status": "ok", "storage": "in-memory"}
+async def readyz(db: Annotated[AsyncSession, Depends(get_db)]) -> dict[str, str]:
+    """Readiness probe — checks that the database is reachable."""
+    try:
+        await db.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="database unavailable") from exc
+    return {"status": "ok", "storage": "postgres"}
 
 
 @app.get("/metrics", tags=["ops"])
@@ -40,26 +46,46 @@ async def metrics() -> Response:
 
 
 @app.post("/shorten", response_model=ShortenResponse, status_code=201, tags=["urls"])
-async def shorten_url(body: ShortenRequest) -> ShortenResponse:
+async def shorten_url(
+    body: ShortenRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ShortenResponse:
     """Accept a long URL and return a short code."""
     code = secrets.token_urlsafe(8)  # ~11 URL-safe chars, 64 bits of entropy
-    record = URLRecord(
-        code=code,
-        original_url=str(body.url),
-        created_at=datetime.now(UTC),
-    )
-    store.save(record)
+    url = Url(code=code, original_url=str(body.url))
+    db.add(url)
+    await db.commit()
     urls_created_total.inc()
-    urls_stored.set(store.total())
     return ShortenResponse(code=code, short_url=f"{settings.base_url}/{code}")
 
 
+async def _increment_hits(code: str) -> None:
+    """Background task: increment hit_count without blocking the redirect.
+
+    Failures are silently dropped — a missed counter increment is preferable
+    to surfacing a DB error to the user after they've already been redirected.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(Url).where(Url.code == code).values(hit_count=Url.hit_count + 1)
+            )
+            await session.commit()
+    except Exception:
+        pass
+
+
 @app.get("/{code}", tags=["urls"])
-async def redirect(code: str) -> RedirectResponse:
+async def redirect(
+    code: str,
+    background_tasks: BackgroundTasks,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> RedirectResponse:
     """Look up a short code and redirect to the original URL."""
-    record = store.get(code)
-    if record is None:
+    result = await db.execute(select(Url).where(Url.code == code))
+    url = result.scalar_one_or_none()
+    if url is None:
         raise HTTPException(status_code=404, detail="Short URL not found")
-    store.increment_hits(code)
+    background_tasks.add_task(_increment_hits, code)
     redirects_total.inc()
-    return RedirectResponse(url=record.original_url, status_code=302)
+    return RedirectResponse(url=url.original_url, status_code=302)
