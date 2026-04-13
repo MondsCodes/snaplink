@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     base_url: str = "http://localhost:8000"
     app_name: str = "SnapLink"
     database_url: str = "postgresql+asyncpg://snaplink:snaplink@localhost:5432/snaplink"
+    redis_url: str = "redis://localhost:6379/0"
 
 
 settings = Settings()
